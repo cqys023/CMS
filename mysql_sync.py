@@ -1,3 +1,4 @@
+
 import os
 import json
 import sys
@@ -8,7 +9,7 @@ import pymysql
 JSON_FILE = "wsyzy_vod.json"
 TABLE_NAME = "wsyzy_vod"
 
-# 每批20条，先保持较小批次，降低单次SQL压力
+# 每批20条
 BATCH_SIZE = 20
 
 # 每批最多尝试3次
@@ -29,7 +30,7 @@ FIELDS = [
 
 def val(item, key):
     value = item.get(key)
-    return "" if value is None else str(value)
+    return "" if value is None else str(value).strip()
 
 
 def load_json():
@@ -71,8 +72,8 @@ def connect_db():
 def create_table(conn):
     print("正在检查数据表...", flush=True)
 
-    sql = """
-    CREATE TABLE IF NOT EXISTS `wsyzy_vod` (
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
         `id` VARCHAR(50) NOT NULL,
         `last` VARCHAR(30) DEFAULT '',
         `tid` VARCHAR(50) DEFAULT '',
@@ -117,11 +118,71 @@ def make_sql():
     """
 
 
+def get_existing_records(conn, batch):
+    """
+    查询当前批次影片在数据库中的 last 和 dl。
+    只查询本批次的ID，避免逐条查询数据库。
+    """
+
+    ids = [str(item["id"]) for item in batch]
+
+    if not ids:
+        return {}
+
+    placeholders = ",".join(["%s"] * len(ids))
+
+    sql = f"""
+        SELECT `id`, `last`, `dl`
+        FROM `{TABLE_NAME}`
+        WHERE `id` IN ({placeholders})
+    """
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+        cursor.execute(sql, ids)
+        rows = cursor.fetchall()
+
+    existing = {}
+
+    for row in rows:
+        existing[str(row["id"])] = {
+            "last": "" if row["last"] is None else str(row["last"]).strip(),
+            "dl": "" if row["dl"] is None else str(row["dl"]).strip()
+        }
+
+    return existing
+
+
+def check_changed(item, old):
+    """
+    双重判断：
+
+    1. last发生变化：更新
+    2. dl发生变化：更新
+    3. last和dl都没变化：跳过
+    """
+
+    if old is None:
+        return "new"
+
+    new_last = val(item, "last")
+    old_last = old["last"]
+
+    new_dl = val(item, "dl")
+    old_dl = old["dl"]
+
+    if new_last != old_last:
+        return "updated"
+
+    if new_dl != old_dl:
+        return "updated"
+
+    return "skipped"
+
+
 def sync_batch(conn, sql, batch, batch_no, total_batches):
-    rows = [
-        tuple(val(item, field) for field in FIELDS)
-        for item in batch
-    ]
+    """
+    先对比数据库，再只写入新增或发生变化的影片。
+    """
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -131,8 +192,46 @@ def sync_batch(conn, sql, batch, batch_no, total_batches):
                 flush=True
             )
 
-            # 检查连接状态
             conn.ping(reconnect=True)
+
+            # 一次查询本批次全部影片的数据库记录
+            existing = get_existing_records(conn, batch)
+
+            new_records = []
+            update_records = []
+            skipped_records = []
+
+            for item in batch:
+                video_id = str(item["id"])
+                old = existing.get(video_id)
+
+                status = check_changed(item, old)
+
+                if status == "new":
+                    new_records.append(item)
+
+                elif status == "updated":
+                    update_records.append(item)
+
+                else:
+                    skipped_records.append(item)
+
+            # 合并需要写入的记录
+            changed_records = new_records + update_records
+
+            if not changed_records:
+                print(
+                    f"第 {batch_no}/{total_batches} 批没有变化，"
+                    f"跳过 {len(skipped_records)} 条",
+                    flush=True
+                )
+
+                return conn, len(new_records), len(update_records), len(skipped_records)
+
+            rows = [
+                tuple(val(item, field) for field in FIELDS)
+                for item in changed_records
+            ]
 
             with conn.cursor() as cursor:
                 cursor.executemany(sql, rows)
@@ -140,11 +239,19 @@ def sync_batch(conn, sql, batch, batch_no, total_batches):
             conn.commit()
 
             print(
-                f"第 {batch_no}/{total_batches} 批提交成功",
+                f"第 {batch_no}/{total_batches} 批提交成功："
+                f"新增 {len(new_records)} 条，"
+                f"更新 {len(update_records)} 条，"
+                f"跳过 {len(skipped_records)} 条",
                 flush=True
             )
 
-            return conn
+            return (
+                conn,
+                len(new_records),
+                len(update_records),
+                len(skipped_records)
+            )
 
         except pymysql.err.OperationalError as e:
             print(
@@ -182,7 +289,7 @@ def sync_batch(conn, sql, batch, batch_no, total_batches):
                 pass
             raise
 
-    return conn
+    return conn, 0, 0, 0
 
 
 def sync_data():
@@ -215,6 +322,9 @@ def sync_data():
         ) // BATCH_SIZE
 
         processed = 0
+        total_inserted = 0
+        total_updated = 0
+        total_skipped = 0
 
         print("开始分批同步...", flush=True)
 
@@ -223,13 +333,22 @@ def sync_data():
         ):
             batch = records[start:start + BATCH_SIZE]
 
-            conn = sync_batch(
+            (
+                conn,
+                inserted,
+                updated,
+                skipped
+            ) = sync_batch(
                 conn,
                 sql,
                 batch,
                 batch_no,
                 total_batches
             )
+
+            total_inserted += inserted
+            total_updated += updated
+            total_skipped += skipped
 
             processed += len(batch)
 
@@ -242,18 +361,22 @@ def sync_data():
             time.sleep(0.1)
 
         print("=" * 45, flush=True)
-        print("所有批次已经提交，开始检查数据库...", flush=True)
+        print("所有批次已经处理，开始检查数据库...", flush=True)
 
-        # 只做一次总数查询，不再执行821次核验查询
         with conn.cursor() as cursor:
             cursor.execute(
                 f"SELECT COUNT(*) FROM `{TABLE_NAME}`"
             )
             database_total = cursor.fetchone()[0]
 
+        print("=" * 45, flush=True)
+        print("本次同步统计：", flush=True)
+        print(f"新增影片：{total_inserted}", flush=True)
+        print(f"更新影片：{total_updated}", flush=True)
+        print(f"跳过影片：{total_skipped}", flush=True)
         print(f"本次处理记录：{processed}", flush=True)
         print(f"数据库当前总记录：{database_total}", flush=True)
-        print("本次数据批次全部提交成功", flush=True)
+        print("本次数据同步完成", flush=True)
         print("=" * 45, flush=True)
 
     finally:
