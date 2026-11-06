@@ -195,67 +195,39 @@ def parse_play_info(item):
         <dd flag="播放源2"><![CDATA[第1集$url#第2集$url]]></dd>
     </dl>
 
-    转换为：
-
-    播放源1$$$播放源2$$$播放地址1$$$播放地址2
+    只提取播放地址，不拼接播放源名称。
     """
 
-    play_from_list = []
     play_url_list = []
 
     dl_node = None
 
+    # 查找 dl 节点
     for node in item:
         if local_tag(node.tag) == "dl":
             dl_node = node
             break
 
     if dl_node is not None:
-
         for node in dl_node:
-
             if local_tag(node.tag) != "dd":
                 continue
 
-            flag = (
-                node.attrib.get("flag")
-                or node.attrib.get("from")
-                or ""
-            ).strip()
+            # 只获取 dd 内部的集数和播放地址
+            play_url = "".join(node.itertext()).strip()
 
-            play_url = "".join(
-                node.itertext()
-            ).strip()
-
-            if flag or play_url:
-                play_from_list.append(flag)
+            if play_url:
                 play_url_list.append(play_url)
 
-    # 兼容部分接口直接返回 vod_play_from / vod_play_url 的情况
-    if not play_from_list:
+    # 兼容没有 dl 节点的情况
+    if not play_url_list:
+        play_url = xml_text(item, "vod_play_url")
 
-        play_from = xml_text(
-            item,
-            "vod_play_from"
-        )
+        if play_url:
+            return play_url
 
-        play_url = xml_text(
-            item,
-            "vod_play_url"
-        )
-
-        if play_from or play_url:
-            return play_from + "$$$" + play_url
-
-    if not play_from_list:
-        return ""
-
-    # 苹果CMS标准多播放源格式
-    return (
-        "$$$".join(play_from_list)
-        + "$$$"
-        + "$$$".join(play_url_list)
-    )
+    # 多个播放源之间仍然使用 $$$ 分隔
+    return "$$$".join(play_url_list)
 
 
 # ============================================================
