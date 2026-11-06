@@ -8,7 +8,7 @@ import requests
 import pymysql
 import xml.etree.ElementTree as ET
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 # ============================================================
@@ -30,7 +30,7 @@ TABLE_NAME = "wsyzy_vod"
 # 采集最近48小时
 HOURS = 48
 
-# 接口每页数量（如果接口支持该参数）
+# 每页数量
 PAGE_SIZE = 100
 
 # 数据库每批20条
@@ -39,11 +39,17 @@ BATCH_SIZE = 20
 # 每批最多重试3次
 MAX_RETRIES = 3
 
-# WSYZY 的 vod_time 如果使用北京时间，保持默认8
-# 如果接口时间实际是UTC，请设置为0
+# 数据源时间偏移：
+# 北京时间为 UTC+8，默认8
+# 如果接口 last 字段实际为UTC时间，设置为0
 SOURCE_TIME_OFFSET_HOURS = int(
     os.environ.get("SOURCE_TIME_OFFSET_HOURS", "8")
 )
+
+# 是否保留接口返回的全部时间有效记录
+# False：客户端再严格筛选最近48小时
+# True：依赖接口 h=48 参数筛选
+USE_API_TIME_FILTER_ONLY = False
 
 
 # ============================================================
@@ -87,6 +93,11 @@ FIELDS = [
 # 通用函数
 # ============================================================
 
+def local_tag(tag):
+    """兼容带 XML 命名空间的标签"""
+    return tag.split("}")[-1].lower()
+
+
 def val(item, key):
     value = item.get(key)
 
@@ -97,25 +108,53 @@ def val(item, key):
 
 
 def xml_text(item, field):
-    node = item.find(field)
+    """
+    读取 XML 直接子节点。
+    支持普通文本、CDATA以及带命名空间的标签。
+    """
 
-    if node is None or node.text is None:
-        return ""
+    for node in item:
+        if local_tag(node.tag) == field.lower():
+            return "".join(node.itertext()).strip()
 
-    return node.text.strip()
+    return ""
 
 
 def parse_time(value):
+    """解析常见日期格式及 Unix 时间戳"""
+
     if not value:
         return None
 
-    value = value.strip()
+    value = str(value).strip()
+
+    # Unix 时间戳
+    if value.isdigit():
+        try:
+            timestamp = int(value)
+
+            if len(value) == 13:
+                timestamp = timestamp / 1000
+
+            if len(value) in (10, 13):
+                return (
+                    datetime.fromtimestamp(
+                        timestamp,
+                        tz=timezone.utc
+                    )
+                    .replace(tzinfo=None)
+                    + timedelta(hours=SOURCE_TIME_OFFSET_HOURS)
+                )
+        except (ValueError, OverflowError, OSError):
+            pass
 
     formats = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M"
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d"
     ]
 
     for fmt in formats:
@@ -124,7 +163,99 @@ def parse_time(value):
         except ValueError:
             continue
 
-    return None
+    # 尝试 ISO 格式
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is not None:
+            parsed = (
+                parsed.astimezone(timezone.utc)
+                .replace(tzinfo=None)
+                + timedelta(hours=SOURCE_TIME_OFFSET_HOURS)
+            )
+
+        return parsed
+
+    except ValueError:
+        return None
+
+
+# ============================================================
+# XML 播放信息解析
+# ============================================================
+
+def parse_play_info(item):
+    """
+    苹果CMS XML播放信息结构：
+
+    <dl>
+        <dd flag="播放源1"><![CDATA[第1集$url#第2集$url]]></dd>
+        <dd flag="播放源2"><![CDATA[第1集$url#第2集$url]]></dd>
+    </dl>
+
+    转换为：
+
+    播放源1$$$播放源2$$$播放地址1$$$播放地址2
+    """
+
+    play_from_list = []
+    play_url_list = []
+
+    dl_node = None
+
+    for node in item:
+        if local_tag(node.tag) == "dl":
+            dl_node = node
+            break
+
+    if dl_node is not None:
+
+        for node in dl_node:
+
+            if local_tag(node.tag) != "dd":
+                continue
+
+            flag = (
+                node.attrib.get("flag")
+                or node.attrib.get("from")
+                or ""
+            ).strip()
+
+            play_url = "".join(
+                node.itertext()
+            ).strip()
+
+            if flag or play_url:
+                play_from_list.append(flag)
+                play_url_list.append(play_url)
+
+    # 兼容部分接口直接返回 vod_play_from / vod_play_url 的情况
+    if not play_from_list:
+
+        play_from = xml_text(
+            item,
+            "vod_play_from"
+        )
+
+        play_url = xml_text(
+            item,
+            "vod_play_url"
+        )
+
+        if play_from or play_url:
+            return play_from + "$$$" + play_url
+
+    if not play_from_list:
+        return ""
+
+    # 苹果CMS标准多播放源格式
+    return (
+        "$$$".join(play_from_list)
+        + "$$$"
+        + "$$$".join(play_url_list)
+    )
 
 
 # ============================================================
@@ -132,41 +263,87 @@ def parse_time(value):
 # ============================================================
 
 def parse_video(item):
-    vod_id = xml_text(item, "vod_id")
 
-    if not vod_id:
+    # 苹果CMS标准XML字段
+    video_id = xml_text(item, "id")
+
+    if not video_id:
+        # 兼容另一种字段命名
+        video_id = xml_text(item, "vod_id")
+
+    if not video_id:
         return None
 
-    vod_time = xml_text(item, "vod_time")
-
-    # 播放源
-    play_from = xml_text(item, "vod_play_from")
-
-    # 播放地址和集数
-    play_url = xml_text(item, "vod_play_url")
-
-    # 苹果CMS播放信息格式
-    dl = ""
-
-    if play_from or play_url:
-        dl = play_from + "$$$" + play_url
+    vod_time = (
+        xml_text(item, "last")
+        or xml_text(item, "vod_time")
+    )
 
     return {
         "last": vod_time,
-        "id": vod_id,
-        "tid": xml_text(item, "type_id"),
-        "name": xml_text(item, "vod_name"),
-        "type": xml_text(item, "type_name"),
-        "pic": xml_text(item, "vod_pic"),
-        "lang": xml_text(item, "vod_lang"),
-        "area": xml_text(item, "vod_area"),
-        "year": xml_text(item, "vod_year"),
-        "state": xml_text(item, "vod_state"),
-        "note": xml_text(item, "vod_remarks"),
-        "actor": xml_text(item, "vod_actor"),
-        "director": xml_text(item, "vod_director"),
-        "dl": dl,
-        "des": xml_text(item, "vod_content")
+        "id": video_id,
+
+        "tid": (
+            xml_text(item, "tid")
+            or xml_text(item, "type_id")
+        ),
+
+        "name": (
+            xml_text(item, "name")
+            or xml_text(item, "vod_name")
+        ),
+
+        "type": (
+            xml_text(item, "type")
+            or xml_text(item, "type_name")
+        ),
+
+        "pic": (
+            xml_text(item, "pic")
+            or xml_text(item, "vod_pic")
+        ),
+
+        "lang": (
+            xml_text(item, "lang")
+            or xml_text(item, "vod_lang")
+        ),
+
+        "area": (
+            xml_text(item, "area")
+            or xml_text(item, "vod_area")
+        ),
+
+        "year": (
+            xml_text(item, "year")
+            or xml_text(item, "vod_year")
+        ),
+
+        "state": (
+            xml_text(item, "state")
+            or xml_text(item, "vod_state")
+        ),
+
+        "note": (
+            xml_text(item, "note")
+            or xml_text(item, "vod_remarks")
+        ),
+
+        "actor": (
+            xml_text(item, "actor")
+            or xml_text(item, "vod_actor")
+        ),
+
+        "director": (
+            xml_text(item, "director")
+            or xml_text(item, "vod_director")
+        ),
+
+        "dl": parse_play_info(item),
+
+        "des": (
+            xml_text(item, "des")
+            or xml_text(item, "vod_content")
+        )
     }
 
 
@@ -175,6 +352,7 @@ def parse_video(item):
 # ============================================================
 
 def fetch_page(session, page):
+
     params = {
         "ac": "videolist",
         "pg": page,
@@ -185,6 +363,7 @@ def fetch_page(session, page):
     for attempt in range(1, MAX_RETRIES + 1):
 
         try:
+
             response = session.get(
                 API_URL,
                 params=params,
@@ -193,33 +372,112 @@ def fetch_page(session, page):
 
             response.raise_for_status()
 
-            # XML 编码由 XML 声明或 requests 推断
-            response.encoding = response.apparent_encoding
+            print(
+                f"请求地址：{response.url}",
+                flush=True
+            )
 
-            root = ET.fromstring(response.content)
+            print(
+                f"HTTP状态：{response.status_code}",
+                flush=True
+            )
 
-            videos = []
+            print(
+                f"响应大小：{len(response.content)} 字节",
+                flush=True
+            )
 
-            for node in root.iter():
-                if node.tag.split("}")[-1] == "video":
-                    video = parse_video(node)
+            # 直接解析XML原始内容
+            root = ET.fromstring(
+                response.content
+            )
 
-                    if video:
-                        videos.append(video)
+            # 查找影片节点
+            video_nodes = [
+                node
+                for node in root.iter()
+                if local_tag(node.tag) == "video"
+            ]
 
-            # 获取总页数
+            # 读取总页数
             page_count = 1
 
             for node in root.iter():
-                if node.tag.split("}")[-1] == "list":
+
+                if local_tag(node.tag) == "list":
+
                     page_count = int(
-                        node.attrib.get("pagecount", "1") or "1"
+                        node.attrib.get(
+                            "pagecount",
+                            "1"
+                        ) or "1"
                     )
+
                     break
 
-            return videos, page_count
+            # 某些接口把分页属性放在根节点
+            if page_count <= 1:
+
+                page_count = int(
+                    root.attrib.get(
+                        "pagecount",
+                        "1"
+                    ) or "1"
+                )
+
+            videos = []
+
+            for node in video_nodes:
+
+                video = parse_video(node)
+
+                if video:
+                    videos.append(video)
+
+            print(
+                f"第 {page} 页 XML影片节点："
+                f"{len(video_nodes)}",
+                flush=True
+            )
+
+            print(
+                f"第 {page} 页成功解析："
+                f"{len(videos)}",
+                flush=True
+            )
+
+            if not video_nodes:
+
+                print(
+                    "警告：XML中没有找到 video 节点",
+                    flush=True
+                )
+
+                print(
+                    "XML响应前1500字符：",
+                    response.content[:1500].decode(
+                        response.encoding or "utf-8",
+                        errors="replace"
+                    ),
+                    flush=True
+                )
+
+                if page == 1:
+                    raise RuntimeError(
+                        "接口第一页没有返回 video 节点，"
+                        "请检查接口地址和请求参数"
+                    )
+
+            if video_nodes and not videos:
+
+                raise RuntimeError(
+                    "发现XML影片节点，但所有影片均无法解析ID"
+                )
+
+            return videos, max(page_count, 1)
 
         except Exception as e:
+
             print(
                 f"下载第 {page} 页失败，"
                 f"重试 {attempt}/{MAX_RETRIES}：{e}",
@@ -240,14 +498,12 @@ def fetch_page(session, page):
 
 def fetch_recent_videos():
 
-    print("=" * 50, flush=True)
+    print("=" * 55, flush=True)
     print("开始下载 WSYZY 最近48小时数据", flush=True)
-    print("=" * 50, flush=True)
+    print("=" * 55, flush=True)
 
-    # GitHub Actions 通常使用UTC时间。
-    # 根据数据源时间偏移转换成数据源本地时间。
     source_now = (
-        datetime.utcnow()
+        datetime.now(timezone.utc).replace(tzinfo=None)
         + timedelta(hours=SOURCE_TIME_OFFSET_HOURS)
     )
 
@@ -263,15 +519,29 @@ def fetch_recent_videos():
         flush=True
     )
 
+    print(
+        f"时间偏移：UTC+{SOURCE_TIME_OFFSET_HOURS}",
+        flush=True
+    )
+
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/xml,text/xml,*/*"
     })
 
     all_videos = {}
 
+    total_downloaded = 0
+    invalid_time_count = 0
+    filtered_count = 0
+
     try:
+
         page = 1
         page_count = 1
 
@@ -292,22 +562,45 @@ def fetch_recent_videos():
                 flush=True
             )
 
+            total_downloaded += len(videos)
+
             for video in videos:
 
-                vod_time = parse_time(video["last"])
+                vod_time = parse_time(
+                    video["last"]
+                )
 
                 if vod_time is None:
+
+                    invalid_time_count += 1
+
+                    if invalid_time_count <= 5:
+                        print(
+                            f"时间格式无法解析："
+                            f"ID={video['id']}，"
+                            f"last={video['last']}",
+                            flush=True
+                        )
+
                     continue
 
-                # 严格过滤最近48小时
-                if not (start_time <= vod_time <= source_now):
-                    continue
+                # 如果完全依赖API的h=48筛选，
+                # 则不再进行客户端时间过滤
+                if not USE_API_TIME_FILTER_ONLY:
 
-                # 相同ID去重
+                    if not (
+                        start_time <= vod_time <= source_now
+                    ):
+
+                        filtered_count += 1
+                        continue
+
+                # 按ID去重
                 all_videos[str(video["id"])] = video
 
             print(
-                f"目前符合48小时条件：{len(all_videos)} 条",
+                f"目前符合48小时条件："
+                f"{len(all_videos)} 条",
                 flush=True
             )
 
@@ -315,16 +608,48 @@ def fetch_recent_videos():
             time.sleep(0.3)
 
     finally:
+
         session.close()
 
     result = list(all_videos.values())
 
-    print("=" * 50, flush=True)
+    print("=" * 55, flush=True)
+
     print(
-        f"最近48小时采集完成，共 {len(result)} 部影片",
+        f"接口下载总数：{total_downloaded}",
         flush=True
     )
-    print("=" * 50, flush=True)
+
+    print(
+        f"时间无法解析：{invalid_time_count}",
+        flush=True
+    )
+
+    print(
+        f"48小时以外过滤：{filtered_count}",
+        flush=True
+    )
+
+    print(
+        f"最终采集影片：{len(result)}",
+        flush=True
+    )
+
+    print("=" * 55, flush=True)
+
+    # 防止接口异常或解析错误造成空JSON
+    if total_downloaded == 0:
+
+        raise RuntimeError(
+            "接口没有下载到任何影片，停止任务"
+        )
+
+    if not result:
+
+        raise RuntimeError(
+            "接口下载到了影片，但经过时间筛选后为0条。"
+            "请检查数据源时间格式或时区配置。"
+        )
 
     return result
 
@@ -334,6 +659,11 @@ def fetch_recent_videos():
 # ============================================================
 
 def save_json(records):
+
+    if not records:
+        raise ValueError(
+            "禁止生成空JSON文件"
+        )
 
     print("正在生成 JSON 文件...", flush=True)
 
@@ -350,7 +680,9 @@ def save_json(records):
             indent=2
         )
 
-    file_size = os.path.getsize(JSON_FILE)
+    file_size = os.path.getsize(
+        JSON_FILE
+    )
 
     print(
         f"JSON生成成功：{JSON_FILE}",
@@ -503,6 +835,7 @@ def get_existing_records(conn, batch):
                 "" if row["last"] is None
                 else str(row["last"]).strip()
             ),
+
             "dl": (
                 "" if row["dl"] is None
                 else str(row["dl"]).strip()
@@ -522,10 +855,18 @@ def check_changed(item, old):
     if old is None:
         return "new"
 
-    new_last = val(item, "last").strip()
+    new_last = val(
+        item,
+        "last"
+    ).strip()
+
     old_last = old["last"]
 
-    new_dl = val(item, "dl").strip()
+    new_dl = val(
+        item,
+        "dl"
+    ).strip()
+
     old_dl = old["dl"]
 
     # 更新时间发生变化
@@ -563,9 +904,11 @@ def sync_batch(
                 flush=True
             )
 
-            conn.ping(reconnect=True)
+            conn.ping(
+                reconnect=True
+            )
 
-            # 一次性查询本批次的数据库记录
+            # 查询本批次数据库已有记录
             existing = get_existing_records(
                 conn,
                 batch
@@ -577,9 +920,13 @@ def sync_batch(
 
             for item in batch:
 
-                video_id = str(item["id"])
+                video_id = str(
+                    item["id"]
+                )
 
-                old = existing.get(video_id)
+                old = existing.get(
+                    video_id
+                )
 
                 status = check_changed(
                     item,
@@ -587,12 +934,15 @@ def sync_batch(
                 )
 
                 if status == "new":
+
                     new_records.append(item)
 
                 elif status == "updated":
+
                     update_records.append(item)
 
                 else:
+
                     skipped_records.append(item)
 
             changed_records = (
@@ -706,19 +1056,19 @@ def sync_data(records):
             "MySQL环境变量配置不完整"
         )
 
-    print("=" * 50, flush=True)
-    print("开始MySQL数据同步", flush=True)
-    print(f"待处理影片：{len(records)}", flush=True)
-    print("=" * 50, flush=True)
-
     if not records:
 
-        print(
-            "最近48小时没有符合条件的影片，无需同步",
-            flush=True
+        raise ValueError(
+            "待同步数据为空，停止MySQL同步"
         )
 
-        return
+    print("=" * 50, flush=True)
+    print("开始MySQL数据同步", flush=True)
+    print(
+        f"待处理影片：{len(records)}",
+        flush=True
+    )
+    print("=" * 50, flush=True)
 
     conn = None
 
@@ -739,7 +1089,10 @@ def sync_data(records):
         total_skipped = 0
         processed = 0
 
-        print("开始分批同步...", flush=True)
+        print(
+            "开始分批同步...",
+            flush=True
+        )
 
         for batch_no, start in enumerate(
             range(0, len(records), BATCH_SIZE),
@@ -779,7 +1132,10 @@ def sync_data(records):
             time.sleep(0.1)
 
         print("=" * 50, flush=True)
-        print("所有批次处理完成，检查数据库...", flush=True)
+        print(
+            "所有批次处理完成，检查数据库...",
+            flush=True
+        )
 
         with conn.cursor() as cursor:
 
@@ -791,12 +1147,30 @@ def sync_data(records):
 
         print("=" * 50, flush=True)
         print("本次同步统计：", flush=True)
-        print(f"新增影片：{total_inserted}", flush=True)
-        print(f"更新影片：{total_updated}", flush=True)
-        print(f"跳过影片：{total_skipped}", flush=True)
-        print(f"本次处理：{processed}", flush=True)
-        print(f"数据库总记录：{database_total}", flush=True)
-        print("MySQL同步成功", flush=True)
+        print(
+            f"新增影片：{total_inserted}",
+            flush=True
+        )
+        print(
+            f"更新影片：{total_updated}",
+            flush=True
+        )
+        print(
+            f"跳过影片：{total_skipped}",
+            flush=True
+        )
+        print(
+            f"本次处理：{processed}",
+            flush=True
+        )
+        print(
+            f"数据库总记录：{database_total}",
+            flush=True
+        )
+        print(
+            "MySQL同步成功",
+            flush=True
+        )
         print("=" * 50, flush=True)
 
     finally:
@@ -816,17 +1190,21 @@ def sync_data(records):
 def main():
 
     print("=" * 55, flush=True)
-    print("WSYZY最近48小时影视数据同步任务启动", flush=True)
+    print(
+        "WSYZY最近48小时影视数据同步任务启动",
+        flush=True
+    )
     print("=" * 55, flush=True)
 
     # 第一步：下载并筛选最近48小时影片
     records = fetch_recent_videos()
 
-    # 第二步：生成JSON文件
+    # 第二步：只有采集成功才生成JSON
     save_json(records)
 
     # 第三步：读取JSON，确认文件生成成功
     if not os.path.exists(JSON_FILE):
+
         raise FileNotFoundError(
             f"JSON文件生成失败：{JSON_FILE}"
         )
@@ -840,12 +1218,20 @@ def main():
         json_records = json.load(f)
 
     if not isinstance(json_records, list):
+
         raise ValueError(
             "JSON顶层必须是数组"
         )
 
+    if not json_records:
+
+        raise ValueError(
+            "JSON文件为空，停止MySQL同步"
+        )
+
     print(
-        f"JSON文件读取成功，共 {len(json_records)} 条",
+        f"JSON文件读取成功，共 "
+        f"{len(json_records)} 条",
         flush=True
     )
 
@@ -853,9 +1239,16 @@ def main():
     sync_data(json_records)
 
     print("=" * 55, flush=True)
-    print("全部任务执行成功！", flush=True)
+    print(
+        "全部任务执行成功！",
+        flush=True
+    )
     print("=" * 55, flush=True)
 
+
+# ============================================================
+# 程序入口
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -872,7 +1265,10 @@ if __name__ == "__main__":
             flush=True
         )
 
-        print("完整错误位置：", flush=True)
+        print(
+            "完整错误位置：",
+            flush=True
+        )
 
         traceback.print_exc()
 
