@@ -82,10 +82,7 @@ FIELDS = [
     "year",
     "state",
     "note",
-    "actor",
     "director",
-    "dl",
-    "des"
 ]
 
 
@@ -186,17 +183,6 @@ def parse_time(value):
 # XML 播放信息解析
 # ============================================================
 
-def parse_play_info(item):
-    """
-    苹果CMS XML播放信息结构：
-
-    <dl>
-        <dd flag="播放源1"><![CDATA[第1集$url#第2集$url]]></dd>
-        <dd flag="播放源2"><![CDATA[第1集$url#第2集$url]]></dd>
-    </dl>
-
-    只提取播放地址，不拼接播放源名称。
-    """
 
     play_url_list = []
 
@@ -300,22 +286,11 @@ def parse_video(item):
             or xml_text(item, "vod_remarks")
         ),
 
-        "actor": (
-            xml_text(item, "actor")
-            or xml_text(item, "vod_actor")
-        ),
-
         "director": (
             xml_text(item, "director")
             or xml_text(item, "vod_director")
-        ),
-
-        "dl": parse_play_info(item),
-
-        "des": (
-            xml_text(item, "des")
-            or xml_text(item, "vod_content")
         )
+
     }
 
 
@@ -719,10 +694,7 @@ def create_table(conn):
         `year` VARCHAR(20) DEFAULT '',
         `state` VARCHAR(100) DEFAULT '',
         `note` VARCHAR(500) DEFAULT '',
-        `actor` TEXT,
         `director` TEXT,
-        `dl` LONGTEXT,
-        `des` LONGTEXT,
         PRIMARY KEY (`id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     COLLATE=utf8mb4_unicode_ci
@@ -784,8 +756,12 @@ def get_existing_records(conn, batch):
         ["%s"] * len(ids)
     )
 
+    columns = ",".join(
+        f"`{field}`" for field in FIELDS
+    )
+
     sql = f"""
-        SELECT `id`, `last`, `dl`
+        SELECT {columns}
         FROM `{TABLE_NAME}`
         WHERE `id` IN ({placeholders})
     """
@@ -795,23 +771,19 @@ def get_existing_records(conn, batch):
     ) as cursor:
 
         cursor.execute(sql, ids)
-
         rows = cursor.fetchall()
 
     existing = {}
 
     for row in rows:
+        video_id = str(row["id"])
 
-        existing[str(row["id"])] = {
-            "last": (
-                "" if row["last"] is None
-                else str(row["last"]).strip()
-            ),
-
-            "dl": (
-                "" if row["dl"] is None
-                else str(row["dl"]).strip()
+        existing[video_id] = {
+            field: (
+                "" if row.get(field) is None
+                else str(row.get(field)).strip()
             )
+            for field in FIELDS
         }
 
     return existing
@@ -827,31 +799,19 @@ def check_changed(item, old):
     if old is None:
         return "new"
 
-    new_last = val(
-        item,
-        "last"
-    ).strip()
+    # 比较所有保留字段
+    for field in FIELDS:
 
-    old_last = old["last"]
+        if field == "id":
+            continue
 
-    new_dl = val(
-        item,
-        "dl"
-    ).strip()
+        new_value = val(item, field).strip()
+        old_value = old.get(field, "")
 
-    old_dl = old["dl"]
+        if new_value != old_value:
+            return "updated"
 
-    # 更新时间发生变化
-    if new_last != old_last:
-        return "updated"
-
-    # 播放源、集数、播放地址发生变化
-    if new_dl != old_dl:
-        return "updated"
-
-    # 两者都没变化
     return "skipped"
-
 
 # ============================================================
 # 同步一个批次
