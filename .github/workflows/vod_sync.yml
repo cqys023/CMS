@@ -7,6 +7,7 @@ on:
     - cron: "0 5 * * *"
     # 每天北京时间晚上7点运行
     - cron: "0 11 * * *"
+    SOURCE_TIME_OFFSET_HOURS: "8"
 
   # 支持手动运行
   workflow_dispatch:
