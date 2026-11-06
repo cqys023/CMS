@@ -3,8 +3,10 @@ name: 每日影视数据同步到MySQL
 
 on:
   schedule:
-    # 每天北京时间凌晨3点运行
-    - cron: "0 19 * * *"
+    # 每天北京时间下午1点运行
+    - cron: "0 5 * * *"
+    # 每天北京时间晚上7点运行
+    - cron: "0 11 * * *"
 
   # 支持手动运行
   workflow_dispatch:
